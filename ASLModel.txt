@@ -1,0 +1,153 @@
+# ======================
+# 1. Mount Google Drive
+# ======================
+from google.colab import drive
+drive.mount('/content/drive')
+
+# Optional: Change to your project directory in Drive
+%cd /content/drive/MyDrive/ASL_Project
+
+# ======================
+# 2. Install Dependencies (Latest Versions)
+# ======================
+!pip install --upgrade pip
+!pip install tensorflow opencv-python mediapipe scikit-learn matplotlib
+
+# ======================
+# 3. Import Libraries
+# ======================
+import cv2
+import mediapipe as mp
+import numpy as np
+import os
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+import matplotlib.pyplot as plt
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense
+
+print("TensorFlow Version:", tf.__version__)
+
+# ======================
+# 4. Initialize MediaPipe for BOTH hands
+# ======================
+mp_hands = mp.solutions.hands
+mp_drawing = mp.solutions.drawing_utils
+
+hands = mp_hands.Hands(
+    static_image_mode=False,
+    max_num_hands=2,  # Track both hands
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5
+)
+
+# ======================
+# 5. Function to Extract Landmarks from Video (BOTH HANDS)
+# ======================
+def extract_landmarks_from_video(video_path):
+    cap = cv2.VideoCapture(video_path)
+    landmarks_sequence = []
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = hands.process(image)
+
+        # Initialize left & right hand landmarks (zeros if not detected)
+        left_hand = [0] * 63
+        right_hand = [0] * 63
+
+        if results.multi_hand_landmarks and results.multi_handedness:
+            for hand_landmarks, handedness in zip(results.multi_hand_landmarks, results.multi_handedness):
+                landmarks = []
+                for lm in hand_landmarks.landmark:
+                    landmarks.extend([lm.x, lm.y, lm.z])
+
+                if handedness.classification[0].label == "Left":
+                    left_hand = landmarks
+                else:
+                    right_hand = landmarks
+
+        # Combine both hands into one vector per frame
+        frame_landmarks = left_hand + right_hand  # total = 126 values
+        landmarks_sequence.append(frame_landmarks)
+
+    cap.release()
+    return np.array(landmarks_sequence)
+
+# ======================
+# 6. Prepare Dataset
+# ======================
+# Dataset folder structure:
+# dataset/
+#   hello/
+#     video1.mp4
+#     video2.mp4
+#   thank_you/
+#     video1.mp4
+#     video2.mp4
+
+DATA_PATH = "dataset"
+actions = os.listdir(DATA_PATH)
+
+X, y = [], []
+
+for label in actions:
+    folder_path = os.path.join(DATA_PATH, label)
+    for file in os.listdir(folder_path):
+        video_path = os.path.join(folder_path, file)
+        sequence = extract_landmarks_from_video(video_path)
+        X.append(sequence)
+        y.append(label)
+
+# Pad sequences so all videos have same length
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+X = pad_sequences(X, padding='post', dtype='float32')
+
+# Encode labels into numbers
+le = LabelEncoder()
+y = le.fit_transform(y)
+
+# Train/test split
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2)
+
+# ======================
+# 7. Build LSTM Model
+# ======================
+model = Sequential()
+model.add(LSTM(64, return_sequences=True, activation='relu', input_shape=(X_train.shape[1], X_train.shape[2])))
+model.add(LSTM(128, return_sequences=False, activation='relu'))
+model.add(Dense(64, activation='relu'))
+model.add(Dense(len(actions), activation='softmax'))
+
+model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+model.summary()
+
+# ======================
+# 8. Train Model & Export
+# ======================
+history = model.fit(X_train, y_train, epochs=20, validation_data=(X_test, y_test))
+
+# Save standard Keras model
+model.save("asl_lstm_model.h5")
+
+# Export TensorFlow Lite model for Raspberry Pi
+converter = tf.lite.TFLiteConverter.from_keras_model(model)
+tflite_model = converter.convert()
+with open("asl_lstm_model.tflite", "wb") as f:
+    f.write(tflite_model)
+
+print("Models saved: asl_lstm_model.h5 & asl_lstm_model.tflite")
+
+# ======================
+# 9. Plot Accuracy/Loss
+# ======================
+plt.figure(figsize=(10, 5))
+plt.plot(history.history['accuracy'], label='Train Accuracy')
+plt.plot(history.history['val_accuracy'], label='Validation Accuracy')
+plt.legend()
+plt.show()
