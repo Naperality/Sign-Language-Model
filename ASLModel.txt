@@ -2,10 +2,18 @@
 # 1. Mount Google Drive
 # ======================
 from google.colab import drive
+import os
+
+# 1. Mount Google Drive first
 drive.mount('/content/drive')
 
-# Optional: Change to your project directory in Drive
-%cd /content/drive/MyDrive/ASL_Project
+# Create and go to project folder in Google Drive
+PROJECT_PATH = "/content/drive/MyDrive/ASL_Project"
+os.makedirs(PROJECT_PATH, exist_ok=True)
+%cd $PROJECT_PATH
+
+print(f"✅ Project folder ready at: {PROJECT_PATH}")
+
 
 # ======================
 # 2. Install Dependencies (Latest Versions)
@@ -19,13 +27,13 @@ drive.mount('/content/drive')
 import cv2
 import mediapipe as mp
 import numpy as np
-import os
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 import matplotlib.pyplot as plt
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense
+from tensorflow.keras.preprocessing.sequence import pad_sequences
 
 print("TensorFlow Version:", tf.__version__)
 
@@ -33,14 +41,13 @@ print("TensorFlow Version:", tf.__version__)
 # 4. Initialize MediaPipe for BOTH hands
 # ======================
 mp_hands = mp.solutions.hands
-mp_drawing = mp.solutions.drawing_utils
-
 hands = mp_hands.Hands(
     static_image_mode=False,
-    max_num_hands=2,  # Track both hands
+    max_num_hands=2,
     min_detection_confidence=0.5,
     min_tracking_confidence=0.5
 )
+mp_drawing = mp.solutions.drawing_utils
 
 # ======================
 # 5. Function to Extract Landmarks from Video (BOTH HANDS)
@@ -57,7 +64,6 @@ def extract_landmarks_from_video(video_path):
         image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = hands.process(image)
 
-        # Initialize left & right hand landmarks (zeros if not detected)
         left_hand = [0] * 63
         right_hand = [0] * 63
 
@@ -72,8 +78,7 @@ def extract_landmarks_from_video(video_path):
                 else:
                     right_hand = landmarks
 
-        # Combine both hands into one vector per frame
-        frame_landmarks = left_hand + right_hand  # total = 126 values
+        frame_landmarks = left_hand + right_hand  # 126 values
         landmarks_sequence.append(frame_landmarks)
 
     cap.release()
@@ -82,7 +87,15 @@ def extract_landmarks_from_video(video_path):
 # ======================
 # 6. Prepare Dataset
 # ======================
-# Dataset folder structure:
+DATA_PATH = os.path.join(PROJECT_PATH, "dataset")
+if not os.path.exists(DATA_PATH):
+    os.makedirs(DATA_PATH)
+    print(f"⚠️ Dataset folder created at {DATA_PATH}. Please add your videos in label folders.")
+else:
+    print(f"📂 Using dataset from {DATA_PATH}")
+
+"""```
+# Folder structure should be:
 # dataset/
 #   hello/
 #     video1.mp4
@@ -90,25 +103,29 @@ def extract_landmarks_from_video(video_path):
 #   thank_you/
 #     video1.mp4
 #     video2.mp4
+```
+"""
 
-DATA_PATH = "dataset"
 actions = os.listdir(DATA_PATH)
+if not actions:
+    print("❌ No labels found in dataset folder. Please upload videos first.")
 
 X, y = [], []
-
 for label in actions:
     folder_path = os.path.join(DATA_PATH, label)
+    if not os.path.isdir(folder_path):
+        continue
     for file in os.listdir(folder_path):
         video_path = os.path.join(folder_path, file)
+        print(f"🔍 Processing {video_path} ...")
         sequence = extract_landmarks_from_video(video_path)
         X.append(sequence)
         y.append(label)
 
-# Pad sequences so all videos have same length
-from tensorflow.keras.preprocessing.sequence import pad_sequences
+# Pad sequences to equal length
 X = pad_sequences(X, padding='post', dtype='float32')
 
-# Encode labels into numbers
+# Encode labels
 le = LabelEncoder()
 y = le.fit_transform(y)
 
@@ -118,13 +135,19 @@ X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2)
 # ======================
 # 7. Build LSTM Model
 # ======================
+from tensorflow.keras import Input
+
 model = Sequential()
-model.add(LSTM(64, return_sequences=True, activation='relu', input_shape=(X_train.shape[1], X_train.shape[2])))
+model.add(Input(shape=(X_train.shape[1], X_train.shape[2])))
+model.add(LSTM(64, return_sequences=True, activation='relu'))
 model.add(LSTM(128, return_sequences=False, activation='relu'))
 model.add(Dense(64, activation='relu'))
 model.add(Dense(len(actions), activation='softmax'))
 
-model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+model.compile(optimizer='adam',
+              loss='sparse_categorical_crossentropy',
+              metrics=['accuracy'])
+
 model.summary()
 
 # ======================
@@ -133,15 +156,27 @@ model.summary()
 history = model.fit(X_train, y_train, epochs=20, validation_data=(X_test, y_test))
 
 # Save standard Keras model
-model.save("asl_lstm_model.h5")
 
-# Export TensorFlow Lite model for Raspberry Pi
+model_h5_path = os.path.join(PROJECT_PATH, "asl_lstm_model.h5")
+model_tflite_path = os.path.join(PROJECT_PATH, "asl_lstm_model.tflite")
+
+model.save(model_h5_path)
+
 converter = tf.lite.TFLiteConverter.from_keras_model(model)
-tflite_model = converter.convert()
-with open("asl_lstm_model.tflite", "wb") as f:
-    f.write(tflite_model)
 
-print("Models saved: asl_lstm_model.h5 & asl_lstm_model.tflite")
+# Allow TensorFlow ops that TFLite doesn’t fully support
+converter.target_spec.supported_ops = [
+    tf.lite.OpsSet.TFLITE_BUILTINS,  # standard TFLite ops
+    tf.lite.OpsSet.SELECT_TF_OPS     # include TF ops fallback
+]
+
+# Prevent lowering of tensor list ops (needed for LSTM)
+converter._experimental_lower_tensor_list_ops = False
+
+# Optional: enable optimizations for smaller model size
+converter.optimizations = [tf.lite.Optimize.DEFAULT]
+
+tflite_model = converter.convert()
 
 # ======================
 # 9. Plot Accuracy/Loss
