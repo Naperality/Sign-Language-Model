@@ -178,6 +178,11 @@ converter.optimizations = [tf.lite.Optimize.DEFAULT]
 
 tflite_model = converter.convert()
 
+with open(model_tflite_path, "wb") as f:
+    f.write(tflite_model)
+
+print(f"✅ TFLite model saved at {model_tflite_path}")
+
 # ======================
 # 9. Plot Accuracy/Loss
 # ======================
