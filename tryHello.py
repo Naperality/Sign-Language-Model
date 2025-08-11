@@ -6,7 +6,7 @@ from tensorflow.keras.preprocessing.sequence import pad_sequences
 
 # ===== Load model & labels =====
 MODEL_PATH = "asl_lstm_model.h5"  # your trained model
-ACTIONS = ['hello']  # must match training exactly!
+ACTIONS = ['hello', 'nothing' , 'thank_you']  # must match training exactly!
 
 model = tf.keras.models.load_model(MODEL_PATH)
 
