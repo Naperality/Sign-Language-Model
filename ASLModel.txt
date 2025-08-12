@@ -1,194 +1,332 @@
-# ======================
-# 1. Mount Google Drive
-# ======================
+# ASL_Colab_Holistic.py
+# Colab-ready end-to-end pipeline adapted from your uploaded "Action Detection Refined.ipynb".
+# - Mounts Google Drive
+# - Installs dependencies
+# - Uses MediaPipe Holistic for landmarks
+# - Loads dataset from: /content/drive/MyDrive/ASL_Project/dataset/<label>/*.mp4
+# - Extracts keypoints sequences
+# - Builds and trains an LSTM model
+# - Saves model + label encoder back to Drive
+
+# NOTE: Run this in Google Colab. Execute cells in order.
+
+# ----------------------
+# 1 Mount Google Drive
+# ----------------------
 from google.colab import drive
 import os
+from pathlib import Path
 
-# 1. Mount Google Drive first
 drive.mount('/content/drive')
 
-# Create and go to project folder in Google Drive
+# Project path - change if you want a different location
 PROJECT_PATH = "/content/drive/MyDrive/ASL_Project"
-os.makedirs(PROJECT_PATH, exist_ok=True)
+Path(PROJECT_PATH).mkdir(parents=True, exist_ok=True)
 %cd $PROJECT_PATH
-
 print(f"✅ Project folder ready at: {PROJECT_PATH}")
 
+# ----------------------
+# 2 Install dependencies
+# ----------------------
+# Run once in the Colab runtime. If you already installed, you can skip.
+!pip install --quiet --upgrade pip
+!pip install tensorflow opencv-python mediapipe scikit-learn matplotlib joblib
 
-# ======================
-# 2. Install Dependencies (Latest Versions)
-# ======================
-!pip install --upgrade pip
-!pip install tensorflow opencv-python mediapipe scikit-learn matplotlib
-
-# ======================
-# 3. Import Libraries
-# ======================
+# ----------------------
+# 3 Imports
+# ----------------------
 import cv2
-import mediapipe as mp
 import numpy as np
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder
-import matplotlib.pyplot as plt
+import mediapipe as mp
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense
-from tensorflow.keras.preprocessing.sequence import pad_sequences
+from tensorflow.keras.layers import LSTM, Dense, Dropout, Masking
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+import joblib
+import time
+import glob
+import json
+import matplotlib.pyplot as plt
 
-print("TensorFlow Version:", tf.__version__)
-
-# ======================
-# 4. Initialize MediaPipe for BOTH hands
-# ======================
-mp_hands = mp.solutions.hands
-hands = mp_hands.Hands(
-    static_image_mode=False,
-    max_num_hands=2,
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5
-)
+# ----------------------
+# 4 MediaPipe Holistic setup
+# ----------------------
+mp_holistic = mp.solutions.holistic
 mp_drawing = mp.solutions.drawing_utils
 
-# ======================
-# 5. Function to Extract Landmarks from Video (BOTH HANDS)
-# ======================
-def extract_landmarks_from_video(video_path):
-    cap = cv2.VideoCapture(video_path)
-    landmarks_sequence = []
+# Helper: mediapipe detection wrapper
+def mediapipe_detection(image, model):
+    """Run MediaPipe holistic model on an RGB image and return image & results."""
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    image.flags.writeable = False
+    results = model.process(image)
+    image.flags.writeable = True
+    image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+    return image, results
 
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
+# Helper: draw landmarks (optional visualization)
+def draw_landmarks(image, results):
+    # Pose
+    if results.pose_landmarks:
+        mp_drawing.draw_landmarks(image, results.pose_landmarks, mp.solutions.holistic.POSE_CONNECTIONS)
+    # Face
+    if results.face_landmarks:
+        mp_drawing.draw_landmarks(image, results.face_landmarks, mp.solutions.holistic.FACEMESH_TESSELATION)
+    # Left & right hands
+    if results.left_hand_landmarks:
+        mp_drawing.draw_landmarks(image, results.left_hand_landmarks, mp.solutions.holistic.HAND_CONNECTIONS)
+    if results.right_hand_landmarks:
+        mp_drawing.draw_landmarks(image, results.right_hand_landmarks, mp.solutions.holistic.HAND_CONNECTIONS)
+    return image
 
-        image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = hands.process(image)
+# ----------------------
+# 5 Keypoint extraction
+# ----------------------
+# This extracts a fixed-length vector per frame combining pose, face, left & right hands.
+# The original notebook used holistic; we'll replicate keypoint layout.
 
-        left_hand = [0] * 63
-        right_hand = [0] * 63
+def extract_keypoints(results):
+    # Pose: 33 landmarks * (x,y,z,visibility) -> 33*4 = 132
+    pose = np.zeros(33*4)
+    if results.pose_landmarks:
+        pose_landmarks = results.pose_landmarks.landmark
+        pose = np.array([[lm.x, lm.y, lm.z, lm.visibility] for lm in pose_landmarks]).flatten()
 
-        if results.multi_hand_landmarks and results.multi_handedness:
-            for hand_landmarks, handedness in zip(results.multi_hand_landmarks, results.multi_handedness):
-                landmarks = []
-                for lm in hand_landmarks.landmark:
-                    landmarks.extend([lm.x, lm.y, lm.z])
+    # Face: 468 landmarks * (x,y,z) -> 468*3 = 1404
+    face = np.zeros(468*3)
+    if results.face_landmarks:
+        face_landmarks = results.face_landmarks.landmark
+        face = np.array([[lm.x, lm.y, lm.z] for lm in face_landmarks]).flatten()
 
-                if handedness.classification[0].label == "Left":
-                    left_hand = landmarks
-                else:
-                    right_hand = landmarks
+    # Left hand: 21 * (x,y,z) = 63
+    left_hand = np.zeros(21*3)
+    if results.left_hand_landmarks:
+        left = results.left_hand_landmarks.landmark
+        left_hand = np.array([[lm.x, lm.y, lm.z] for lm in left]).flatten()
 
-        frame_landmarks = left_hand + right_hand  # 126 values
-        landmarks_sequence.append(frame_landmarks)
+    # Right hand: 21 * (x,y,z) = 63
+    right_hand = np.zeros(21*3)
+    if results.right_hand_landmarks:
+        right = results.right_hand_landmarks.landmark
+        right_hand = np.array([[lm.x, lm.y, lm.z] for lm in right]).flatten()
 
-    cap.release()
-    return np.array(landmarks_sequence)
+    return np.concatenate([pose, face, left_hand, right_hand])
 
-# ======================
-# 6. Prepare Dataset
-# ======================
-DATA_PATH = os.path.join(PROJECT_PATH, "dataset")
+# ----------------------
+# 6 Dataset path & labels
+# ----------------------
+DATA_PATH = os.path.join(PROJECT_PATH, 'dataset')
 if not os.path.exists(DATA_PATH):
-    os.makedirs(DATA_PATH)
-    print(f"⚠️ Dataset folder created at {DATA_PATH}. Please add your videos in label folders.")
+    os.makedirs(DATA_PATH, exist_ok=True)
+    print(f"⚠️ Dataset folder created at {DATA_PATH}. Please upload videos in label subfolders.")
+
+# Folder structure expected:
+# dataset/<label>/*.mp4
+labels = [d for d in os.listdir(DATA_PATH) if os.path.isdir(os.path.join(DATA_PATH, d))]
+if not labels:
+    print("❌ No labels found in dataset folder. Please upload videos first and re-run this cell.")
 else:
-    print(f"📂 Using dataset from {DATA_PATH}")
+    print(f"✅ Found labels: {labels}")
 
-"""```
-# Folder structure should be:
-# dataset/
-#   hello/
-#     video1.mp4
-#     video2.mp4
-#   thank_you/
-#     video1.mp4
-#     video2.mp4
-```
-"""
+# ----------------------
+# 7 Video -> keypoint sequences
+# ----------------------
+# Parameters
+SEQUENCE_LENGTH = 30  # number of frames per sample (tweakable)
+SAMPLE_RATE = 1       # sample every frame (set >1 to skip frames)
 
-actions = os.listdir(DATA_PATH)
-if not actions:
-    print("❌ No labels found in dataset folder. Please upload videos first.")
+# We'll store sequences and labels
+sequences = []  # list of arrays shape=(SEQUENCE_LENGTH, feature_dim)
+sequence_labels = []
 
-X, y = [], []
-for label in actions:
-    folder_path = os.path.join(DATA_PATH, label)
-    if not os.path.isdir(folder_path):
-        continue
-    for file in os.listdir(folder_path):
-        video_path = os.path.join(folder_path, file)
-        print(f"🔍 Processing {video_path} ...")
-        sequence = extract_landmarks_from_video(video_path)
-        X.append(sequence)
-        y.append(label)
+# Initialize holistic model once and reuse
+with mp_holistic.Holistic(static_image_mode=False,
+                          model_complexity=1,
+                          enable_segmentation=False,
+                          refine_face_landmarks=True,
+                          min_detection_confidence=0.5,
+                          min_tracking_confidence=0.5) as holistic:
 
-# Pad sequences to equal length
-X = pad_sequences(X, padding='post', dtype='float32')
+    for label in labels:
+        label_dir = os.path.join(DATA_PATH, label)
+        video_files = sorted([f for f in os.listdir(label_dir) if f.lower().endswith(('.mp4', '.avi', '.mov', '.mkv'))])
+        print(f"Processing {len(video_files)} videos for label '{label}'")
+
+        for vid in video_files:
+            video_path = os.path.join(label_dir, vid)
+            cap = cv2.VideoCapture(video_path)
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+            keypoints_frames = []
+            frame_idx = 0
+
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                # optional: resize for speed
+                # frame = cv2.resize(frame, (640, 360))
+
+                # sample every SAMPLE_RATE frames
+                if (frame_idx % SAMPLE_RATE) == 0:
+                    image, results = mediapipe_detection(frame, holistic)
+                    kp = extract_keypoints(results)  # fixed-length vector per frame
+                    keypoints_frames.append(kp)
+
+                frame_idx += 1
+
+                # early exit if too many frames (safety)
+                # if frame_idx > 300:
+                #     break
+
+            cap.release()
+
+            # Convert to numpy array
+            keypoints_frames = np.array(keypoints_frames)
+            if keypoints_frames.size == 0:
+                print(f"Warning: no frames / keypoints found in {video_path}. Skipping.")
+                continue
+
+            # If video shorter than SEQUENCE_LENGTH, pad with zeros at the end
+            if keypoints_frames.shape[0] < SEQUENCE_LENGTH:
+                pad_len = SEQUENCE_LENGTH - keypoints_frames.shape[0]
+                pad = np.zeros((pad_len, keypoints_frames.shape[1]))
+                seq = np.vstack([keypoints_frames, pad])
+            else:
+                # If longer, take a centered clip of length SEQUENCE_LENGTH
+                start = max(0, (keypoints_frames.shape[0] - SEQUENCE_LENGTH)//2)
+                seq = keypoints_frames[start:start+SEQUENCE_LENGTH]
+
+            sequences.append(seq)
+            sequence_labels.append(label)
+
+print(f"✅ Extracted {len(sequences)} sequences. Each sequence shape: {sequences[0].shape if sequences else None}")
+
+# ----------------------
+# 8 Convert to arrays and encode labels
+# ----------------------
+if not sequences:
+    raise RuntimeError("No sequences extracted. Please check your dataset and re-run the preprocessing step.")
+
+X = np.array(sequences)
+y = np.array(sequence_labels)
+
+print("X shape:", X.shape)  # (num_samples, SEQUENCE_LENGTH, feature_dim)
+print("y shape:", y.shape)
 
 # Encode labels
 le = LabelEncoder()
-y = le.fit_transform(y)
+y_encoded = le.fit_transform(y)
+print("Classes:", list(le.classes_))
 
-# Train/test split
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2)
+# Save label encoder classes for later use
+classes_path = os.path.join(PROJECT_PATH, 'classes.json')
+with open(classes_path, 'w') as f:
+    json.dump(list(le.classes_), f)
+print(f"Saved classes to {classes_path}")
 
-# ======================
-# 7. Build LSTM Model
-# ======================
-from tensorflow.keras import Input
+# ----------------------
+# 9 Train-test split
+# ----------------------
+X_train, X_test, y_train, y_test = train_test_split(X, y_encoded, test_size=0.2, random_state=42, stratify=y_encoded)
+print("Train samples:", X_train.shape[0], "Test samples:", X_test.shape[0])
 
-model = Sequential()
-model.add(Input(shape=(X_train.shape[1], X_train.shape[2])))
-model.add(LSTM(64, return_sequences=True, activation='relu'))
-model.add(LSTM(128, return_sequences=False, activation='relu'))
-model.add(Dense(64, activation='relu'))
-model.add(Dense(len(actions), activation='softmax'))
+# ----------------------
+# 10 Build model
+# ----------------------
+feature_dim = X.shape[2]
+num_classes = len(le.classes_)
 
-model.compile(optimizer='adam',
-              loss='sparse_categorical_crossentropy',
-              metrics=['accuracy'])
+model = Sequential([
+    Masking(mask_value=0.0, input_shape=(SEQUENCE_LENGTH, feature_dim)),
+    LSTM(128, return_sequences=True),
+    Dropout(0.4),
+    LSTM(64),
+    Dropout(0.4),
+    Dense(64, activation='relu'),
+    Dropout(0.3),
+    Dense(num_classes, activation='softmax')
+])
 
+model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
 model.summary()
 
-# ======================
-# 8. Train Model & Export
-# ======================
-history = model.fit(X_train, y_train, epochs=20, validation_data=(X_test, y_test))
+# ----------------------
+# 11 Train model
+# ----------------------
+EPOCHS = 25
+BATCH_SIZE = 8
 
-# Save standard Keras model
+history = model.fit(
+    X_train, y_train,
+    validation_data=(X_test, y_test),
+    epochs=EPOCHS,
+    batch_size=BATCH_SIZE
+)
 
-model_h5_path = os.path.join(PROJECT_PATH, "asl_lstm_model.h5")
-model_tflite_path = os.path.join(PROJECT_PATH, "asl_lstm_model.tflite")
+# ----------------------
+# 12 Save model & label encoder
+# ----------------------
+model_path = os.path.join(PROJECT_PATH, 'asl_holistic_model.h5')
+model.save(model_path)
+print(f"✅ Model saved to: {model_path}")
 
-model.save(model_h5_path)
+le_path = os.path.join(PROJECT_PATH, 'label_encoder.joblib')
+joblib.dump(le, le_path)
+print(f"✅ Label encoder saved to: {le_path}")
 
-converter = tf.lite.TFLiteConverter.from_keras_model(model)
+# Also save training history
+history_path = os.path.join(PROJECT_PATH, 'training_history.npy')
+np.save(history_path, history.history)
+print(f"Saved training history to {history_path}")
 
-# Allow TensorFlow ops that TFLite doesn’t fully support
-converter.target_spec.supported_ops = [
-    tf.lite.OpsSet.TFLITE_BUILTINS,  # standard TFLite ops
-    tf.lite.OpsSet.SELECT_TF_OPS     # include TF ops fallback
-]
-
-# Prevent lowering of tensor list ops (needed for LSTM)
-converter._experimental_lower_tensor_list_ops = False
-
-# Optional: enable optimizations for smaller model size
-converter.optimizations = [tf.lite.Optimize.DEFAULT]
-
-tflite_model = converter.convert()
-
-with open(model_tflite_path, "wb") as f:
-    f.write(tflite_model)
-
-print(f"✅ TFLite model saved at {model_tflite_path}")
-
-# ======================
-# 9. Plot Accuracy/Loss
-# ======================
-
-plt.figure(figsize=(10, 5))
-plt.plot(history.history['accuracy'], label='Train Accuracy')
-plt.plot(history.history['val_accuracy'], label='Validation Accuracy')
+# ----------------------
+# 13 Plot training curves
+# ----------------------
+plt.figure(figsize=(10,4))
+plt.subplot(1,2,1)
+plt.plot(history.history['loss'], label='train_loss')
+plt.plot(history.history['val_loss'], label='val_loss')
 plt.legend()
+plt.title('Loss')
+
+plt.subplot(1,2,2)
+plt.plot(history.history['accuracy'], label='train_acc')
+plt.plot(history.history['val_accuracy'], label='val_acc')
+plt.legend()
+plt.title('Accuracy')
 plt.show()
+
+# ----------------------
+# 14 Quick inference helper
+# ----------------------
+def predict_from_video(video_path, model, le, sequence_length=SEQUENCE_LENGTH):
+    with mp_holistic.Holistic(static_image_mode=False, refine_face_landmarks=True) as holistic:
+        cap = cv2.VideoCapture(video_path)
+        frames_kp = []
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+            _, results = mediapipe_detection(frame, holistic)
+            kp = extract_keypoints(results)
+            frames_kp.append(kp)
+        cap.release()
+
+    frames_kp = np.array(frames_kp)
+    if frames_kp.shape[0] < sequence_length:
+        pad_len = sequence_length - frames_kp.shape[0]
+        pad = np.zeros((pad_len, frames_kp.shape[1]))
+        seq = np.vstack([frames_kp, pad])
+    else:
+        start = max(0, (frames_kp.shape[0] - sequence_length)//2)
+        seq = frames_kp[start:start+sequence_length]
+
+    seq = np.expand_dims(seq, axis=0)
+    probs = model.predict(seq)[0]
+    pred_idx = np.argmax(probs)
+    return le.inverse_transform([pred_idx])[0], probs[pred_idx]
+
+print('All done — you can now run inference using predict_from_video()')
