@@ -87,26 +87,26 @@ def draw_landmarks(image, results):
 # The original notebook used holistic; we'll replicate keypoint layout.
 
 def extract_keypoints(results):
-    # Pose: 33 landmarks * (x,y,z,visibility) -> 33*4 = 132
-    pose = np.zeros(33*4)
+    # Pose: 33 landmarks * (x,y,z,visibility) = 132
+    pose = np.zeros(33 * 4)
     if results.pose_landmarks:
         pose_landmarks = results.pose_landmarks.landmark
         pose = np.array([[lm.x, lm.y, lm.z, lm.visibility] for lm in pose_landmarks]).flatten()
 
-    # Face: 468 landmarks * (x,y,z) -> 468*3 = 1404
-    face = np.zeros(468*3)
+    # Face: only first 468 landmarks * (x,y,z) = 1404
+    face = np.zeros(468 * 3)
     if results.face_landmarks:
-        face_landmarks = results.face_landmarks.landmark
+        face_landmarks = results.face_landmarks.landmark[:468]  # ensure no iris points
         face = np.array([[lm.x, lm.y, lm.z] for lm in face_landmarks]).flatten()
 
     # Left hand: 21 * (x,y,z) = 63
-    left_hand = np.zeros(21*3)
+    left_hand = np.zeros(21 * 3)
     if results.left_hand_landmarks:
         left = results.left_hand_landmarks.landmark
         left_hand = np.array([[lm.x, lm.y, lm.z] for lm in left]).flatten()
 
     # Right hand: 21 * (x,y,z) = 63
-    right_hand = np.zeros(21*3)
+    right_hand = np.zeros(21 * 3)
     if results.right_hand_landmarks:
         right = results.right_hand_landmarks.landmark
         right_hand = np.array([[lm.x, lm.y, lm.z] for lm in right]).flatten()
